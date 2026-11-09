@@ -24,6 +24,16 @@ builtin_methods <- list(
   )
 )
 
+# Column used with each built-in method: length & ID (mm), porosity, and column
+# volumes for pre-sequence equilibration. Selecting a method fills these in.
+builtin_columns <- list(
+  # Waters ACQUITY UPLC CSH C18, 2.1 x 100 mm, 1.7 um (gradient from Hu et al. 2008,
+  # J Proteome Res 7:4982, originally on an Ascentis Express C8 2.1 x 150 mm)
+  "Lipidomics (RP, 30 min)"            = c(len = 100, id = 2.1, porosity = 0.65, n_cv = 20),
+  # Waters Atlantis Premier BEH Z-HILIC, 2.1 x 150 mm, 1.7 um; 50 column volumes (paper)
+  "Metabolomics (Z-HILIC, Girel 2023)" = c(len = 150, id = 2.1, porosity = 0.65, n_cv = 50)
+)
+
 # ---- helpers ---------------------------------------------------------------
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
@@ -227,7 +237,8 @@ ui <- page_navbar(
             num("n_cv", "Column volumes", 20, step = 5),
             num("porosity", "Porosity", 0.65, step = 0.05)
           ),
-          helpText("20-50 column volumes is typical; HILIC usually needs the high end. ",
+          helpText("Filled in from the selected LC method; saving a method stores these too. ",
+                   "20-50 column volumes is typical; HILIC usually needs the high end. ",
                    "Porosity ~0.65 for fully porous particles, ~0.5 for core-shell. ",
                    "Runs at the method's initial %B and flow.")
         ),
@@ -344,26 +355,45 @@ server <- function(input, output, session) {
   }
 
   # ---- LC methods ----
-  custom <- reactiveVal(list())
+  # Custom methods (timetables) and their column settings, stored in the browser
+  # as JSON: {"methods": {name: [rows]}, "columns": {name: {len, id, porosity, n_cv}}}
+  custom      <- reactiveVal(list())
+  custom_cols <- reactiveVal(list())
   all_methods <- reactive(c(builtin_methods, custom()))
+  all_cols    <- reactive(c(builtin_columns, custom_cols()))
 
   methods_from_json <- function(txt) {
     x <- tryCatch(jsonlite::fromJSON(txt, simplifyDataFrame = TRUE), error = function(e) NULL)
-    if (!is.list(x)) return(list())
-    x <- lapply(x, function(d) {
-      d <- as.data.frame(d)
-      if (!all(c("time", "B", "flow") %in% names(d))) return(NULL)
+    if (!is.list(x)) return(list(methods = list(), columns = list()))
+    if (!is.null(x[["methods"]])) { meths <- x[["methods"]]; cols <- x[["columns"]] %||% list() }
+    else { meths <- x; cols <- list() }                     # older methods-only format
+    meths <- lapply(meths, function(d) {
+      d <- tryCatch(as.data.frame(d), error = function(e) NULL)
+      if (is.null(d) || !all(c("time", "B", "flow") %in% names(d))) return(NULL)
       d <- d[, c("time", "B", "flow")]
       d[] <- lapply(d, as.numeric)
       d
     })
-    x[!vapply(x, is.null, logical(1))]
+    meths <- meths[!vapply(meths, is.null, logical(1))]
+    cols <- lapply(cols, function(cc) {
+      v <- suppressWarnings(as.numeric(unlist(cc)[c("len", "id", "porosity", "n_cv")]))
+      if (anyNA(v)) return(NULL)
+      setNames(v, c("len", "id", "porosity", "n_cv"))
+    })
+    cols <- cols[!vapply(cols, is.null, logical(1))]
+    keep <- setdiff(names(meths), names(builtin_methods))
+    list(methods = meths[keep], columns = cols[intersect(names(cols), keep)])
   }
 
-  store_custom <- function(x, select = NULL) {
-    custom(x)
-    session$sendCustomMessage("save_methods",
-      as.character(jsonlite::toJSON(x, digits = NA)))
+  methods_json <- function(pretty = FALSE) {
+    as.character(jsonlite::toJSON(
+      list(methods = custom(), columns = lapply(custom_cols(), as.list)),
+      digits = NA, auto_unbox = TRUE, pretty = pretty))
+  }
+
+  store_custom <- function(x, cols, select = NULL) {
+    custom(x); custom_cols(cols[intersect(names(cols), names(x))])
+    session$sendCustomMessage("save_methods", methods_json())
     updateSelectInput(session, "method", choices = names(all_methods()),
                       selected = select %||% input$method)
   }
@@ -371,8 +401,7 @@ server <- function(input, output, session) {
   observeEvent(input$stored_methods, {
     if (nzchar(input$stored_methods)) {
       x <- methods_from_json(input$stored_methods)
-      x <- x[!names(x) %in% names(builtin_methods)]
-      custom(x)
+      custom(x$methods); custom_cols(x$columns)
       updateSelectInput(session, "method", choices = names(all_methods()),
                         selected = input$method)
     }
@@ -383,6 +412,13 @@ server <- function(input, output, session) {
     req(m)
     updateTextAreaInput(session, "method_text", value = method_to_text(m))
     updateTextInput(session, "method_name", value = input$method)
+    cc <- all_cols()[[input$method]]
+    if (!is.null(cc)) {
+      updateNumericInput(session, "col_len",  value = cc[["len"]])
+      updateNumericInput(session, "col_id",   value = cc[["id"]])
+      updateNumericInput(session, "porosity", value = cc[["porosity"]])
+      updateNumericInput(session, "n_cv",     value = cc[["n_cv"]])
+    }
   })
 
   cur_method <- reactive(parse_method(input$method_text))
@@ -407,8 +443,11 @@ server <- function(input, output, session) {
       return(showNotification("That's a built-in method name - choose a new name to save your version.",
                               type = "warning"))
     x <- custom(); x[[nm]] <- m$df
-    store_custom(x, select = nm)
-    showNotification(paste0("Saved \"", nm, "\""), type = "message")
+    cols <- custom_cols()
+    cols[[nm]] <- c(len = clean(input$col_len), id = clean(input$col_id),
+                    porosity = clean(input$porosity), n_cv = clean(input$n_cv))
+    store_custom(x, cols, select = nm)
+    showNotification(paste0("Saved \"", nm, "\" with the current column settings"), type = "message")
   })
 
   observeEvent(input$delete_method, {
@@ -416,24 +455,23 @@ server <- function(input, output, session) {
     if (nm %in% names(builtin_methods))
       return(showNotification("Built-in methods can't be deleted", type = "warning"))
     x <- custom(); x[[nm]] <- NULL
-    store_custom(x, select = names(builtin_methods)[1])
+    store_custom(x, custom_cols(), select = names(builtin_methods)[1])
     showNotification(paste0("Deleted \"", nm, "\""), type = "message")
   })
 
   output$export_methods <- downloadHandler(
     filename = function() paste0("lcms_methods_", Sys.Date(), ".json"),
-    content  = function(file) writeLines(
-      as.character(jsonlite::toJSON(custom(), digits = NA, pretty = TRUE)), file)
+    content  = function(file) writeLines(methods_json(pretty = TRUE), file)
   )
 
   observeEvent(input$import_methods, {
     txt <- paste(readLines(input$import_methods$datapath, warn = FALSE), collapse = "\n")
     x <- methods_from_json(txt)
-    x <- x[!names(x) %in% names(builtin_methods)]
-    if (!length(x)) return(showNotification("No valid methods found in that file", type = "error"))
-    y <- custom(); y[names(x)] <- x
-    store_custom(y, select = names(x)[1])
-    showNotification(sprintf("Imported %d method(s)", length(x)), type = "message")
+    if (!length(x$methods)) return(showNotification("No valid methods found in that file", type = "error"))
+    y <- custom(); y[names(x$methods)] <- x$methods
+    cols <- custom_cols(); cols[names(x$columns)] <- x$columns
+    store_custom(y, cols, select = names(x$methods)[1])
+    showNotification(sprintf("Imported %d method(s)", length(x$methods)), type = "message")
   })
 
   observe({
