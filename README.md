@@ -1,4 +1,4 @@
-# LC-MS Run Time & Cost Calculator
+# LC-MS Run Time, Cost & Solvent Calculator
 
 A browser-based Shiny app (via [Shinylive](https://posit-dev.github.io/r-shinylive/)) that estimates total LC-MS sequence time and instrument cost from:
 
@@ -7,6 +7,8 @@ A browser-based Shiny app (via [Shinylive](https://posit-dev.github.io/r-shinyli
 - total blanks and QCs (start, interval, end), with optional separate method times
 - single polarity, separate pos & neg injections, or polarity switching
 - instrument rate ($/h), booking fee, and optional whole-hour billing
+- solvent A and B volumes from the LC pump timetable (time, %B, flow), with built-in lipidomics and metabolomics methods, a safety margin, prime volume and bottle count
+- custom LC methods: edit, save (kept in your browser), and export/import as JSON to share
 
 It also generates the full injection order with estimated start times, downloadable as CSV.
 
