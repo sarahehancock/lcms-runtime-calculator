@@ -131,7 +131,7 @@ num <- function(id, label, value, min = 0, step = 1) {
 
 inj_types <- c("Sample", "QC", "Blank")
 
-MANUAL <- "Manual entry"   # LC method option: type run time, flow and average %B
+MANUAL <- "Manual entry"   # LC method option: type a new timetable in the method editor
 
 # Browser storage for custom methods (per browser; use Export/Import to move them)
 storage_js <- tags$script(HTML("
@@ -148,6 +148,7 @@ storage_js <- tags$script(HTML("
 # ---- UI --------------------------------------------------------------------
 
 ui <- page_navbar(
+  id = "main_nav",
   title = "LC-MS Run Calculator",
   theme = bs_theme(version = 5, bootswatch = "flatly"),
   header = storage_js,
@@ -161,18 +162,12 @@ ui <- page_navbar(
         "Samples & method",
         selectInput("method", "LC method", choices = c(names(builtin_methods), MANUAL)),
         conditionalPanel(
-          sprintf("input.method != '%s'", MANUAL),
-          checkboxInput("sync_gradient", "Set run time from LC method", TRUE)
-        ),
-        conditionalPanel(
           sprintf("input.method == '%s'", MANUAL),
-          layout_columns(
-            num("man_flow", "Flow (mL/min)", 0.3, step = 0.01),
-            num("man_B", "Average %B", 50, step = 5)
-          ),
-          helpText("Solvent use = run time × flow, split by the average %B. ",
-                   "Set the column under Column equilibration.")
+          div(class = "alert alert-info py-2 px-3 small",
+              "Enter your gradient timetable in the method editor on the ",
+              actionLink("go_editor", "Solvents tab"), ".")
         ),
+        checkboxInput("sync_gradient", "Set run time from LC method", TRUE),
         num("n_samples", "Number of samples", 48, min = 1),
         num("reps", "Injections per sample (technical reps)", 1, min = 1),
         num("gradient", "Gradient / method run time (min)", 30, step = 0.5),
@@ -329,15 +324,16 @@ ui <- page_navbar(
         plotOutput("grad_plot", height = "260px")
       )
     ),
-    conditionalPanel(
-      sprintf("input.method != '%s'", MANUAL),
-      card(
+    card(
+      id = "editor_card",
       card_header("Method editor"),
       layout_columns(
         col_widths = c(5, 7),
         div(
+          uiOutput("manual_hint"),
           textAreaInput("method_text", "Timetable: time (min), %B, flow (mL/min) - one row per line",
-                        value = method_to_text(builtin_methods[[1]]), rows = 13, width = "100%"),
+                        value = method_to_text(builtin_methods[[1]]), rows = 13, width = "100%",
+                        placeholder = "e.g.\n0, 5, 0.3\n2, 5, 0.3\n15, 95, 0.3\n18, 95, 0.3\n18.1, 5, 0.3\n22, 5, 0.3"),
           uiOutput("method_msg")
         ),
         div(
@@ -357,7 +353,6 @@ ui <- page_navbar(
               fileInput("import_methods", NULL, accept = ".json",
                         buttonLabel = "Import...", placeholder = "methods .json"))
         )
-      )
       )
     )
   )
@@ -425,6 +420,11 @@ server <- function(input, output, session) {
   }, once = TRUE)
 
   observeEvent(input$method, {
+    if (identical(input$method, MANUAL)) {
+      updateTextAreaInput(session, "method_text", value = "")
+      updateTextInput(session, "method_name", value = "")
+      return()
+    }
     m <- all_methods()[[input$method]]
     req(m)
     updateTextAreaInput(session, "method_text", value = method_to_text(m))
@@ -440,20 +440,23 @@ server <- function(input, output, session) {
 
   is_manual <- reactive(identical(input$method, MANUAL))
 
-  cur_method <- reactive({
-    if (is_manual()) {
-      rt <- clean(input$gradient)
-      if (rt <= 0) return(list(ok = FALSE, msg = "Enter a run time above 0 min"))
-      B  <- min(100, clean(input$man_B))
-      return(list(ok = TRUE, msg = NULL,
-                  df = data.frame(time = c(0, rt), B = B, flow = clean(input$man_flow))))
-    }
-    parse_method(input$method_text)
+  cur_method <- reactive(parse_method(input$method_text))
+
+  observeEvent(input$go_editor, nav_select("main_nav", "Solvents"))
+
+  output$manual_hint <- renderUI({
+    if (!is_manual()) return(NULL)
+    div(class = "alert alert-info py-2 px-3 small",
+        strong("Manual entry: "),
+        "type the pump timetable below, one row per line (time, %B, flow). ",
+        "Results update as you type. To reuse it, give it a name and click Save method; ",
+        "it will then appear in the LC method list.")
   })
 
   output$method_msg <- renderUI({
     m <- cur_method()
-    if (!m$ok) return(div(class = "text-danger small", m$msg))
+    if (!m$ok) return(div(class = if (is_manual() && !nzchar(trimws(input$method_text)))
+                                    "text-muted small" else "text-danger small", m$msg))
     saved <- all_methods()[[input$method]]
     changed <- is.null(saved) || nrow(saved) != nrow(m$df) ||
       any(abs(as.matrix(saved) - as.matrix(m$df)) > 1e-9)
@@ -503,7 +506,7 @@ server <- function(input, output, session) {
   })
 
   observe({
-    req(isTRUE(input$sync_gradient), !is_manual())
+    req(isTRUE(input$sync_gradient))
     m <- cur_method(); req(m$ok)
     updateNumericInput(session, "gradient", value = max(m$df$time))
   })
@@ -526,6 +529,8 @@ server <- function(input, output, session) {
   output$eq_summary <- renderUI({
     e <- eq()
     if (input$eq_mode == "none") return(NULL)
+    if (!cur_method()$ok) return(div(class = "small text-muted",
+      "Enter a valid gradient on the Solvents tab to calculate equilibration."))
     if (e$F0 <= 0) return(div(class = "small text-danger",
       "The method's initial flow is 0, so equilibration can't be calculated."))
     txt <- if (input$eq_mode == "cv")

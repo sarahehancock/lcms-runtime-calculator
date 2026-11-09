@@ -23,7 +23,7 @@ All settings are in the sidebar on the left, grouped into collapsible sections. 
 | **Gradient / method run time** | Length of one injection's LC method, in minutes. |
 | **Buffer per injection** | Extra time per injection for autosampler draw, needle wash or any dead time between runs. |
 
-**Manual entry:** if you don't have the timetable to hand, choose *Manual entry* and type the run time, flow rate and average %B. Solvent use is then estimated as run time × flow, split by the average %B.
+**Manual entry:** to use a method that isn't in the list, choose *Manual entry*. This clears the **Method editor** on the **Solvents** tab (the sidebar has a link to it), where you type the pump timetable — see [Adding or editing a method](#adding-or-editing-a-method). Results update as you type; save it with a name to add it to the LC method list.
 
 ### 2. Polarity
 
@@ -104,7 +104,7 @@ Built-in methods can't be overwritten or deleted, but you can edit one and save 
 
 The **Method editor** is at the bottom of the **Solvents** tab.
 
-1. Select a method to start from, or clear the box to start from scratch.
+1. Select a method to start from, or choose **Manual entry** to start with an empty timetable.
 2. Enter the pump timetable, one row per line: `time (min), %B, flow (mL/min)`. For example:
    ```
    0, 32, 0.26
