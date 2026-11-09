@@ -1,10 +1,32 @@
-## LC-MS Run Time & Cost Calculator
-## Shinylive-compatible (uses only shiny + bslib)
+## LC-MS Run Time, Cost & Solvent Calculator
+## Shinylive-compatible (uses only shiny + bslib, plus jsonlite which ships with shiny)
 
 library(shiny)
 library(bslib)
 
+# ---- built-in LC methods ---------------------------------------------------
+# Each method is a pump timetable: time (min), %B, flow (mL/min).
+# Composition and flow change linearly between rows, as on the LC pump.
+# For a step change, add two rows close together in time (e.g. 25 and 25.1).
+
+builtin_methods <- list(
+  "Lipidomics (RP, 30 min)" = data.frame(
+    time = c(0, 1.5, 4, 5, 8, 11, 14, 18, 21, 25, 25.1, 30),
+    B    = c(32, 32, 45, 52, 58, 66, 70, 75, 97, 97, 32, 32),
+    flow = 0.26
+  ),
+  # BEH Z-HILIC method from Girel et al. 2023, J Chromatogr A 1697:463994.
+  # "gradient at 350 uL/min and equilibration stage at 450 uL/min" (Discussion).
+  "Metabolomics (Z-HILIC, Girel 2023)" = data.frame(
+    time = c(0, 2, 20, 20.5, 24, 25, 27, 27.1, 34.5),
+    B    = c(0, 0, 72, 100, 100, 0, 0, 0, 0),
+    flow = c(0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.45, 0.45)
+  )
+)
+
 # ---- helpers ---------------------------------------------------------------
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
 
 fmt_dur <- function(min) {
   min <- round(min)
@@ -15,6 +37,49 @@ fmt_dur <- function(min) {
 }
 
 fmt_money <- function(x) paste0("$", formatC(x, format = "f", digits = 2, big.mark = ","))
+
+fmt_vol <- function(ml) {
+  if (ml >= 1000) sprintf("%.2f L", ml / 1000)
+  else if (ml >= 10) sprintf("%.0f mL", ml)
+  else sprintf("%.2f mL", ml)
+}
+
+method_to_text <- function(df) {
+  paste(sprintf("%g, %g, %g", df$time, df$B, df$flow), collapse = "\n")
+}
+
+# Parse "time, %B, flow" lines. Returns list(ok, df, msg).
+parse_method <- function(txt) {
+  lines <- trimws(strsplit(txt %||% "", "\n")[[1]])
+  lines <- lines[nzchar(lines) & !startsWith(lines, "#")]
+  if (length(lines) < 2) return(list(ok = FALSE, msg = "Enter at least two rows: time, %B, flow"))
+  rows <- lapply(lines, function(l) suppressWarnings(as.numeric(strsplit(l, "[,;\t ]+")[[1]])))
+  bad <- which(vapply(rows, function(r) length(r) != 3 || anyNA(r), logical(1)))
+  if (length(bad)) return(list(ok = FALSE, msg = paste0(
+    "Row ", bad[1], " needs three numbers (time, %B, flow): \"", lines[bad[1]], "\"")))
+  df <- as.data.frame(do.call(rbind, rows))
+  names(df) <- c("time", "B", "flow")
+  if (any(diff(df$time) < 0)) return(list(ok = FALSE, msg = "Times must be in increasing order"))
+  if (any(df$B < 0 | df$B > 100)) return(list(ok = FALSE, msg = "%B must be between 0 and 100"))
+  if (any(df$flow < 0)) return(list(ok = FALSE, msg = "Flow cannot be negative"))
+  if (max(df$time) <= 0) return(list(ok = FALSE, msg = "Method must be longer than 0 min"))
+  list(ok = TRUE, df = df, msg = NULL)
+}
+
+# Solvent used by one run of a timetable (mL). %B and flow are linear within
+# each segment, so the integral of flow x %B is computed exactly.
+gradient_volumes <- function(df) {
+  if (df$time[1] > 0) df <- rbind(df[1, ], df)
+  if (df$time[1] > 0) df$time[1] <- 0
+  if (nrow(df) < 2) return(c(A = 0, B = 0, total = 0))
+  i  <- seq_len(nrow(df) - 1)
+  dt <- diff(df$time)
+  F1 <- df$flow[i]; F2 <- df$flow[i + 1]
+  B1 <- df$B[i] / 100; B2 <- df$B[i + 1] / 100
+  total <- sum(dt * (F1 + F2) / 2)
+  vb    <- sum(dt * (F1 * B1 / 3 + F1 * B2 / 6 + F2 * B1 / 6 + F2 * B2 / 3))
+  c(A = total - vb, B = vb, total = total)
+}
 
 # Build one polarity's injection order. Blanks are spread evenly through the
 # run (first at the start, last at the end once there are 2 or more).
@@ -56,11 +121,25 @@ num <- function(id, label, value, min = 0, step = 1) {
 
 inj_types <- c("Sample", "QC", "Blank")
 
+# Browser storage for custom methods (per browser; use Export/Import to move them)
+storage_js <- tags$script(HTML("
+  $(document).on('shiny:connected', function() {
+    var s = '';
+    try { s = localStorage.getItem('lcms_custom_methods') || ''; } catch (e) {}
+    Shiny.setInputValue('stored_methods', s, {priority: 'event'});
+  });
+  Shiny.addCustomMessageHandler('save_methods', function(x) {
+    try { localStorage.setItem('lcms_custom_methods', x); } catch (e) {}
+  });
+"))
+
 # ---- UI --------------------------------------------------------------------
 
-ui <- page_sidebar(
-  title = "LC-MS Run Time & Cost Calculator",
+ui <- page_navbar(
+  title = "LC-MS Run Calculator",
   theme = bs_theme(version = 5, bootswatch = "flatly"),
+  header = storage_js,
+  fillable = FALSE,
 
   sidebar = sidebar(
     width = 330,
@@ -68,12 +147,14 @@ ui <- page_sidebar(
       open = c("Samples & method"),
       accordion_panel(
         "Samples & method",
+        selectInput("method", "LC method", choices = names(builtin_methods)),
+        checkboxInput("sync_gradient", "Set run time from LC method", TRUE),
         num("n_samples", "Number of samples", 48, min = 1),
         num("reps", "Injections per sample (technical reps)", 1, min = 1),
-        num("gradient", "Gradient / method run time (min)", 15, step = 0.5),
+        num("gradient", "Gradient / method run time (min)", 30, step = 0.5),
         num("buffer", "Buffer per injection (min)", 1, step = 0.25),
-        helpText("Buffer = autosampler draw, needle wash, re-equilibration, ",
-                 "or any dead time between injections.")
+        helpText("Buffer = autosampler draw, needle wash, or any dead time ",
+                 "between injections.")
       ),
       accordion_panel(
         "Polarity",
@@ -117,6 +198,15 @@ ui <- page_sidebar(
         )
       ),
       accordion_panel(
+        "Solvents",
+        num("margin", "Safety margin (%)", 10, step = 5),
+        num("prime", "Prime / purge volume per channel (mL)", 20, step = 5),
+        num("bottle", "Bottle size (mL)", 1000, min = 1, step = 250),
+        checkboxInput("idle_flow",
+          "Count flow during buffer, switchover and equilibration (at initial conditions)",
+          TRUE)
+      ),
+      accordion_panel(
         "Instrument cost",
         num("rate", "Instrument rate ($ per hour)", 0, step = 5),
         num("fee", "Fixed booking / setup fee ($)", 0, step = 10),
@@ -131,33 +221,92 @@ ui <- page_sidebar(
     )
   ),
 
-  layout_columns(
-    fill = FALSE,
-    value_box(title = "Total run time", value = textOutput("total_time"),
-              theme = "primary"),
-    value_box(title = "Total injections", value = textOutput("total_inj"),
-              p(textOutput("inj_note", inline = TRUE)), theme = "secondary"),
-    value_box(title = "Estimated finish", value = textOutput("finish"),
-              theme = "success"),
-    value_box(title = "Instrument cost", value = textOutput("cost"),
-              p(textOutput("cost_note", inline = TRUE)), theme = "warning")
+  # ---- Tab 1: run time & cost ----
+  nav_panel(
+    "Run time & cost",
+    layout_columns(
+      fill = FALSE,
+      value_box(title = "Total run time", value = textOutput("total_time"),
+                theme = "primary"),
+      value_box(title = "Total injections", value = textOutput("total_inj"),
+                p(textOutput("inj_note", inline = TRUE)), theme = "secondary"),
+      value_box(title = "Estimated finish", value = textOutput("finish"),
+                theme = "success"),
+      value_box(title = "Instrument cost", value = textOutput("cost"),
+                p(textOutput("cost_note", inline = TRUE)), theme = "warning")
+    ),
+    layout_columns(
+      col_widths = c(5, 7),
+      card(
+        card_header("Breakdown"),
+        tableOutput("breakdown"),
+        plotOutput("bar", height = "220px")
+      ),
+      card(
+        card_header(
+          class = "d-flex justify-content-between align-items-center",
+          "Injection sequence",
+          downloadButton("dl", "CSV", class = "btn-sm")
+        ),
+        div(style = "max-height: 520px; overflow-y: auto;",
+            tableOutput("seq_table"))
+      )
+    )
   ),
 
-  layout_columns(
-    col_widths = c(5, 7),
-    card(
-      card_header("Breakdown"),
-      tableOutput("breakdown"),
-      plotOutput("bar", height = "220px")
+  # ---- Tab 2: solvents ----
+  nav_panel(
+    "Solvents",
+    layout_columns(
+      fill = FALSE,
+      value_box(title = "Solvent A needed", value = textOutput("solv_a"),
+                p(textOutput("solv_a_note", inline = TRUE)), theme = "primary"),
+      value_box(title = "Solvent B needed", value = textOutput("solv_b"),
+                p(textOutput("solv_b_note", inline = TRUE)), theme = "info"),
+      value_box(title = "Per injection", value = textOutput("solv_per"),
+                p(textOutput("solv_per_note", inline = TRUE)), theme = "secondary")
+    ),
+    layout_columns(
+      col_widths = c(7, 5),
+      card(
+        card_header("Solvent breakdown"),
+        tableOutput("solv_table"),
+        helpText("Every injection is assumed to run the selected gradient, including ",
+                 "blanks and QCs. Idle time (buffer, switchover, equilibration) is ",
+                 "counted at the method's initial %B and flow.")
+      ),
+      card(
+        card_header("Gradient"),
+        plotOutput("grad_plot", height = "260px")
+      )
     ),
     card(
-      card_header(
-        class = "d-flex justify-content-between align-items-center",
-        "Injection sequence",
-        downloadButton("dl", "CSV", class = "btn-sm")
-      ),
-      div(style = "max-height: 520px; overflow-y: auto;",
-          tableOutput("seq_table"))
+      card_header("Method editor"),
+      layout_columns(
+        col_widths = c(5, 7),
+        div(
+          textAreaInput("method_text", "Timetable: time (min), %B, flow (mL/min) - one row per line",
+                        value = method_to_text(builtin_methods[[1]]), rows = 13, width = "100%"),
+          uiOutput("method_msg")
+        ),
+        div(
+          helpText("Edits are used in the calculation straight away. %B and flow change ",
+                   "linearly between rows, as on the pump. For a step change, use two rows ",
+                   "close together (e.g. 25, 97 then 25.1, 32). Times before the first row ",
+                   "are held at the first row's conditions."),
+          textInput("method_name", "Method name", value = names(builtin_methods)[1]),
+          div(class = "d-flex flex-wrap gap-2 mb-3",
+              actionButton("save_method", "Save method", class = "btn-primary btn-sm"),
+              actionButton("delete_method", "Delete method", class = "btn-outline-danger btn-sm")),
+          helpText("Saved methods are kept in this browser. Built-in methods can't be ",
+                   "overwritten - save edits under a new name. Use export/import to move ",
+                   "methods to another computer or share them."),
+          div(class = "d-flex flex-wrap gap-2 align-items-start",
+              downloadButton("export_methods", "Export my methods", class = "btn-sm"),
+              fileInput("import_methods", NULL, accept = ".json",
+                        buttonLabel = "Import...", placeholder = "methods .json"))
+        )
+      )
     )
   )
 )
@@ -170,6 +319,106 @@ server <- function(input, output, session) {
     if (is.null(x) || length(x) == 0 || is.na(x) || x < 0) default else x
   }
 
+  # ---- LC methods ----
+  custom <- reactiveVal(list())
+  all_methods <- reactive(c(builtin_methods, custom()))
+
+  methods_from_json <- function(txt) {
+    x <- tryCatch(jsonlite::fromJSON(txt, simplifyDataFrame = TRUE), error = function(e) NULL)
+    if (!is.list(x)) return(list())
+    x <- lapply(x, function(d) {
+      d <- as.data.frame(d)
+      if (!all(c("time", "B", "flow") %in% names(d))) return(NULL)
+      d <- d[, c("time", "B", "flow")]
+      d[] <- lapply(d, as.numeric)
+      d
+    })
+    x[!vapply(x, is.null, logical(1))]
+  }
+
+  store_custom <- function(x, select = NULL) {
+    custom(x)
+    session$sendCustomMessage("save_methods",
+      as.character(jsonlite::toJSON(x, digits = NA)))
+    updateSelectInput(session, "method", choices = names(all_methods()),
+                      selected = select %||% input$method)
+  }
+
+  observeEvent(input$stored_methods, {
+    if (nzchar(input$stored_methods)) {
+      x <- methods_from_json(input$stored_methods)
+      x <- x[!names(x) %in% names(builtin_methods)]
+      custom(x)
+      updateSelectInput(session, "method", choices = names(all_methods()),
+                        selected = input$method)
+    }
+  }, once = TRUE)
+
+  observeEvent(input$method, {
+    m <- all_methods()[[input$method]]
+    req(m)
+    updateTextAreaInput(session, "method_text", value = method_to_text(m))
+    updateTextInput(session, "method_name", value = input$method)
+  })
+
+  cur_method <- reactive(parse_method(input$method_text))
+
+  output$method_msg <- renderUI({
+    m <- cur_method()
+    if (!m$ok) return(div(class = "text-danger small", m$msg))
+    saved <- all_methods()[[input$method]]
+    changed <- is.null(saved) || nrow(saved) != nrow(m$df) ||
+      any(abs(as.matrix(saved) - as.matrix(m$df)) > 1e-9)
+    div(class = "small text-muted",
+        sprintf("%d rows, %g min", nrow(m$df), max(m$df$time)),
+        if (changed) span(class = "text-warning ms-2", "Unsaved edits"))
+  })
+
+  observeEvent(input$save_method, {
+    m <- cur_method()
+    if (!m$ok) return(showNotification(m$msg, type = "error"))
+    nm <- trimws(input$method_name)
+    if (!nzchar(nm)) return(showNotification("Give the method a name", type = "error"))
+    if (nm %in% names(builtin_methods))
+      return(showNotification("That's a built-in method name - choose a new name to save your version.",
+                              type = "warning"))
+    x <- custom(); x[[nm]] <- m$df
+    store_custom(x, select = nm)
+    showNotification(paste0("Saved \"", nm, "\""), type = "message")
+  })
+
+  observeEvent(input$delete_method, {
+    nm <- input$method
+    if (nm %in% names(builtin_methods))
+      return(showNotification("Built-in methods can't be deleted", type = "warning"))
+    x <- custom(); x[[nm]] <- NULL
+    store_custom(x, select = names(builtin_methods)[1])
+    showNotification(paste0("Deleted \"", nm, "\""), type = "message")
+  })
+
+  output$export_methods <- downloadHandler(
+    filename = function() paste0("lcms_methods_", Sys.Date(), ".json"),
+    content  = function(file) writeLines(
+      as.character(jsonlite::toJSON(custom(), digits = NA, pretty = TRUE)), file)
+  )
+
+  observeEvent(input$import_methods, {
+    txt <- paste(readLines(input$import_methods$datapath, warn = FALSE), collapse = "\n")
+    x <- methods_from_json(txt)
+    x <- x[!names(x) %in% names(builtin_methods)]
+    if (!length(x)) return(showNotification("No valid methods found in that file", type = "error"))
+    y <- custom(); y[names(x)] <- x
+    store_custom(y, select = names(x)[1])
+    showNotification(sprintf("Imported %d method(s)", length(x)), type = "message")
+  })
+
+  observe({
+    req(isTRUE(input$sync_gradient))
+    m <- cur_method(); req(m$ok)
+    updateNumericInput(session, "gradient", value = max(m$df$time))
+  })
+
+  # ---- sequence & run time ----
   start_dt <- reactive({
     tm <- if (grepl("^\\d{1,2}:\\d{2}$", input$start_time)) input$start_time else "09:00"
     as.POSIXct(paste(input$start_date, tm), format = "%Y-%m-%d %H:%M", tz = "UTC")
@@ -196,7 +445,6 @@ server <- function(input, output, session) {
       data.frame(Polarity = "", Type = type, Name = name, Minutes = minutes,
                  stringsAsFactors = FALSE)
 
-    # Expand by polarity
     if (input$polarity == "single") {
       df <- cbind(Polarity = input$single_pol, base, stringsAsFactors = FALSE)
     } else if (input$polarity == "switching") {
@@ -293,6 +541,83 @@ server <- function(input, output, session) {
     filename = function() paste0("LCMS_sequence_", Sys.Date(), ".csv"),
     content  = function(file) write.csv(seq_df(), file, row.names = FALSE)
   )
+
+  # ---- solvents ----
+  solv <- reactive({
+    m <- cur_method()
+    validate(need(m$ok, m$msg))
+    df  <- m$df
+    per <- gradient_volumes(df)
+    n   <- n_inj()
+
+    idle_min <- if (isTRUE(input$idle_flow)) {
+      clean(input$buffer) * n +
+        sum(seq_df()$Minutes[seq_df()$Type %in% c("Switchover", "Equilibration")])
+    } else 0
+    F0 <- df$flow[1]; B0 <- df$B[1] / 100
+    idle <- c(A = idle_min * F0 * (1 - B0), B = idle_min * F0 * B0)
+
+    run    <- per[c("A", "B")] * n
+    sub    <- run + idle
+    margin <- sub * clean(input$margin) / 100
+    prime  <- c(A = clean(input$prime), B = clean(input$prime))
+    list(per = per, n = n, run = run, idle = idle, idle_min = idle_min,
+         margin = margin, prime = prime, total = sub + margin + prime)
+  })
+
+  bottles <- function(ml) {
+    b <- max(1, clean(input$bottle, 1000))
+    k <- ceiling(ml / b)
+    sprintf("%d × %s bottle%s", k, fmt_vol(b), if (k == 1) "" else "s")
+  }
+
+  output$solv_a      <- renderText(fmt_vol(solv()$total[["A"]]))
+  output$solv_b      <- renderText(fmt_vol(solv()$total[["B"]]))
+  output$solv_a_note <- renderText(bottles(solv()$total[["A"]]))
+  output$solv_b_note <- renderText(bottles(solv()$total[["B"]]))
+  output$solv_per    <- renderText(fmt_vol(solv()$per[["total"]]))
+  output$solv_per_note <- renderText(sprintf("A %s · B %s per run",
+    fmt_vol(solv()$per[["A"]]), fmt_vol(solv()$per[["B"]])))
+
+  output$solv_table <- renderTable({
+    s <- solv()
+    rows <- list(
+      c("Gradient, per injection",                  s$per[["A"]],   s$per[["B"]]),
+      c(sprintf("Gradient × %d injections", s$n),   s$run[["A"]],   s$run[["B"]]),
+      c(sprintf("Idle at initial conditions (%s)", fmt_dur(s$idle_min)),
+                                                    s$idle[["A"]],  s$idle[["B"]]),
+      c(sprintf("Safety margin (%g%%)", clean(input$margin)),
+                                                    s$margin[["A"]], s$margin[["B"]]),
+      c("Prime / purge",                            s$prime[["A"]], s$prime[["B"]]),
+      c("Total to prepare",                         s$total[["A"]], s$total[["B"]])
+    )
+    out <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+    names(out) <- c("Component", "A (mL)", "B (mL)")
+    out[[2]] <- as.numeric(out[[2]]); out[[3]] <- as.numeric(out[[3]])
+    out$`Total (mL)` <- out[[2]] + out[[3]]
+    out
+  }, striped = TRUE, width = "100%", digits = 1)
+
+  output$grad_plot <- renderPlot({
+    m <- cur_method()
+    validate(need(m$ok, m$msg))
+    d <- m$df
+    if (d$time[1] > 0) d <- rbind(transform(d[1, ], time = 0), d)
+    par(mar = c(4, 4, 1, 4.5))
+    plot(d$time, d$B, type = "n", ylim = c(0, 100), las = 1,
+         xlab = "Time (min)", ylab = "%B")
+    polygon(c(d$time, rev(d$time)), c(d$B, rep(0, nrow(d))),
+            col = adjustcolor("#3498DB", 0.25), border = NA)
+    lines(d$time, d$B, lwd = 2, col = "#2C3E50")
+    par(new = TRUE)
+    fmax <- max(d$flow) * 1.25
+    plot(d$time, d$flow, type = "l", lty = 2, lwd = 2, col = "#E67E22",
+         axes = FALSE, xlab = "", ylab = "", ylim = c(0, if (fmax > 0) fmax else 1))
+    axis(4, las = 1)
+    mtext("Flow (mL/min)", side = 4, line = 3)
+    legend("topleft", c("%B", "Flow"), col = c("#2C3E50", "#E67E22"),
+           lty = c(1, 2), lwd = 2, bty = "n", cex = 0.9)
+  })
 }
 
 shinyApp(ui, server)
