@@ -131,6 +131,8 @@ num <- function(id, label, value, min = 0, step = 1) {
 
 inj_types <- c("Sample", "QC", "Blank")
 
+MANUAL <- "Manual entry"   # LC method option: type run time, flow and average %B
+
 # Browser storage for custom methods (per browser; use Export/Import to move them)
 storage_js <- tags$script(HTML("
   $(document).on('shiny:connected', function() {
@@ -157,8 +159,20 @@ ui <- page_navbar(
       open = c("Samples & method"),
       accordion_panel(
         "Samples & method",
-        selectInput("method", "LC method", choices = names(builtin_methods)),
-        checkboxInput("sync_gradient", "Set run time from LC method", TRUE),
+        selectInput("method", "LC method", choices = c(names(builtin_methods), MANUAL)),
+        conditionalPanel(
+          sprintf("input.method != '%s'", MANUAL),
+          checkboxInput("sync_gradient", "Set run time from LC method", TRUE)
+        ),
+        conditionalPanel(
+          sprintf("input.method == '%s'", MANUAL),
+          layout_columns(
+            num("man_flow", "Flow (mL/min)", 0.3, step = 0.01),
+            num("man_B", "Average %B", 50, step = 5)
+          ),
+          helpText("Solvent use = run time × flow, split by the average %B. ",
+                   "Set the column under Column equilibration.")
+        ),
         num("n_samples", "Number of samples", 48, min = 1),
         num("reps", "Injections per sample (technical reps)", 1, min = 1),
         num("gradient", "Gradient / method run time (min)", 30, step = 0.5),
@@ -315,7 +329,9 @@ ui <- page_navbar(
         plotOutput("grad_plot", height = "260px")
       )
     ),
-    card(
+    conditionalPanel(
+      sprintf("input.method != '%s'", MANUAL),
+      card(
       card_header("Method editor"),
       layout_columns(
         col_widths = c(5, 7),
@@ -341,6 +357,7 @@ ui <- page_navbar(
               fileInput("import_methods", NULL, accept = ".json",
                         buttonLabel = "Import...", placeholder = "methods .json"))
         )
+      )
       )
     )
   )
@@ -381,7 +398,7 @@ server <- function(input, output, session) {
       setNames(v, c("len", "id", "porosity", "n_cv"))
     })
     cols <- cols[!vapply(cols, is.null, logical(1))]
-    keep <- setdiff(names(meths), names(builtin_methods))
+    keep <- setdiff(names(meths), c(names(builtin_methods), MANUAL))
     list(methods = meths[keep], columns = cols[intersect(names(cols), keep)])
   }
 
@@ -394,7 +411,7 @@ server <- function(input, output, session) {
   store_custom <- function(x, cols, select = NULL) {
     custom(x); custom_cols(cols[intersect(names(cols), names(x))])
     session$sendCustomMessage("save_methods", methods_json())
-    updateSelectInput(session, "method", choices = names(all_methods()),
+    updateSelectInput(session, "method", choices = c(names(all_methods()), MANUAL),
                       selected = select %||% input$method)
   }
 
@@ -402,7 +419,7 @@ server <- function(input, output, session) {
     if (nzchar(input$stored_methods)) {
       x <- methods_from_json(input$stored_methods)
       custom(x$methods); custom_cols(x$columns)
-      updateSelectInput(session, "method", choices = names(all_methods()),
+      updateSelectInput(session, "method", choices = c(names(all_methods()), MANUAL),
                         selected = input$method)
     }
   }, once = TRUE)
@@ -421,7 +438,18 @@ server <- function(input, output, session) {
     }
   })
 
-  cur_method <- reactive(parse_method(input$method_text))
+  is_manual <- reactive(identical(input$method, MANUAL))
+
+  cur_method <- reactive({
+    if (is_manual()) {
+      rt <- clean(input$gradient)
+      if (rt <= 0) return(list(ok = FALSE, msg = "Enter a run time above 0 min"))
+      B  <- min(100, clean(input$man_B))
+      return(list(ok = TRUE, msg = NULL,
+                  df = data.frame(time = c(0, rt), B = B, flow = clean(input$man_flow))))
+    }
+    parse_method(input$method_text)
+  })
 
   output$method_msg <- renderUI({
     m <- cur_method()
@@ -439,7 +467,7 @@ server <- function(input, output, session) {
     if (!m$ok) return(showNotification(m$msg, type = "error"))
     nm <- trimws(input$method_name)
     if (!nzchar(nm)) return(showNotification("Give the method a name", type = "error"))
-    if (nm %in% names(builtin_methods))
+    if (nm %in% c(names(builtin_methods), MANUAL))
       return(showNotification("That's a built-in method name - choose a new name to save your version.",
                               type = "warning"))
     x <- custom(); x[[nm]] <- m$df
@@ -452,7 +480,7 @@ server <- function(input, output, session) {
 
   observeEvent(input$delete_method, {
     nm <- input$method
-    if (nm %in% names(builtin_methods))
+    if (nm %in% c(names(builtin_methods), MANUAL))
       return(showNotification("Built-in methods can't be deleted", type = "warning"))
     x <- custom(); x[[nm]] <- NULL
     store_custom(x, custom_cols(), select = names(builtin_methods)[1])
@@ -475,7 +503,7 @@ server <- function(input, output, session) {
   })
 
   observe({
-    req(isTRUE(input$sync_gradient))
+    req(isTRUE(input$sync_gradient), !is_manual())
     m <- cur_method(); req(m$ok)
     updateNumericInput(session, "gradient", value = max(m$df$time))
   })
