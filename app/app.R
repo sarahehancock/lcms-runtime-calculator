@@ -18,7 +18,7 @@ builtin_methods <- list(
   # BEH Z-HILIC method from Girel et al. 2023, J Chromatogr A 1697:463994.
   # "gradient at 350 uL/min and equilibration stage at 450 uL/min" (Discussion).
   "Metabolomics (Z-HILIC, Girel 2023)" = data.frame(
-    time = c(0, 2, 20, 20.5, 24, 25, 27, 27.1, 34.5),
+    time = c(0, 2, 20, 20.5, 24, 24.1, 27, 27.1, 34.5),
     B    = c(0, 0, 72, 100, 100, 0, 0, 0, 0),
     flow = c(0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.45, 0.45)
   )
@@ -203,7 +203,7 @@ ui <- page_navbar(
         num("prime", "Prime / purge volume per channel (mL)", 20, step = 5),
         num("bottle", "Bottle size (mL)", 1000, min = 1, step = 250),
         checkboxInput("idle_flow",
-          "Count flow during buffer, switchover and equilibration (at initial conditions)",
+          "Count flow during buffer and switchover time (at initial conditions)",
           TRUE)
       ),
       accordion_panel(
@@ -213,8 +213,32 @@ ui <- page_navbar(
         checkboxInput("round_up", "Bill in whole hours (round up)", FALSE)
       ),
       accordion_panel(
-        "Extras & start time",
-        num("setup", "One-off pre-sequence equilibration (min)", 0, step = 5),
+        "Column equilibration",
+        radioButtons("eq_mode", "Pre-sequence equilibration",
+          choices = c("Column volumes" = "cv", "Fixed time" = "min", "None" = "none"),
+          selected = "cv", inline = TRUE),
+        conditionalPanel(
+          "input.eq_mode == 'cv'",
+          layout_columns(
+            num("col_len", "Column length (mm)", 100, min = 1, step = 50),
+            num("col_id", "Column ID (mm)", 2.1, min = 0.1, step = 0.1)
+          ),
+          layout_columns(
+            num("n_cv", "Column volumes", 20, step = 5),
+            num("porosity", "Porosity", 0.65, step = 0.05)
+          ),
+          helpText("20-50 column volumes is typical; HILIC usually needs the high end. ",
+                   "Porosity ~0.65 for fully porous particles, ~0.5 for core-shell. ",
+                   "Runs at the method's initial %B and flow.")
+        ),
+        conditionalPanel(
+          "input.eq_mode == 'min'",
+          num("setup", "Equilibration time (min)", 30, step = 5)
+        ),
+        uiOutput("eq_summary")
+      ),
+      accordion_panel(
+        "Start time",
         dateInput("start_date", "Start date", value = Sys.Date()),
         textInput("start_time", "Start time (HH:MM, 24 h)", "09:00")
       )
@@ -272,8 +296,8 @@ ui <- page_navbar(
         card_header("Solvent breakdown"),
         tableOutput("solv_table"),
         helpText("Every injection is assumed to run the selected gradient, including ",
-                 "blanks and QCs. Idle time (buffer, switchover, equilibration) is ",
-                 "counted at the method's initial %B and flow.")
+                 "blanks and QCs. Column equilibration, buffer and switchover time ",
+                 "are counted at the method's initial %B and flow.")
       ),
       card(
         card_header("Gradient"),
@@ -418,6 +442,33 @@ server <- function(input, output, session) {
     updateNumericInput(session, "gradient", value = max(m$df$time))
   })
 
+  # ---- column equilibration ----
+  # Column volume (mL) = pi * r^2 * L * porosity, with r and L in cm.
+  eq <- reactive({
+    m  <- cur_method()
+    F0 <- if (m$ok) m$df$flow[1] else 0
+    if (input$eq_mode == "cv") {
+      v0  <- pi * (clean(input$col_id) / 20)^2 * (clean(input$col_len) / 10) * clean(input$porosity)
+      vol <- clean(input$n_cv) * v0
+      min <- if (F0 > 0) vol / F0 else 0
+      list(min = min, v0 = v0, F0 = F0)
+    } else if (input$eq_mode == "min") {
+      list(min = clean(input$setup), v0 = NA, F0 = F0)
+    } else list(min = 0, v0 = NA, F0 = F0)
+  })
+
+  output$eq_summary <- renderUI({
+    e <- eq()
+    if (input$eq_mode == "none") return(NULL)
+    if (e$F0 <= 0) return(div(class = "small text-danger",
+      "The method's initial flow is 0, so equilibration can't be calculated."))
+    txt <- if (input$eq_mode == "cv")
+      sprintf("1 column volume = %.0f µL. %g CV = %s at %g mL/min → %s.",
+              1000 * e$v0, clean(input$n_cv), fmt_vol(e$min * e$F0), e$F0, fmt_dur(e$min))
+    else sprintf("%s at %g mL/min = %s.", fmt_dur(e$min), e$F0, fmt_vol(e$min * e$F0))
+    div(class = "small text-muted", txt)
+  })
+
   # ---- sequence & run time ----
   start_dt <- reactive({
     tm <- if (grepl("^\\d{1,2}:\\d{2}$", input$start_time)) input$start_time else "09:00"
@@ -463,7 +514,7 @@ server <- function(input, output, session) {
       else rbind(pos, neg)
     }
 
-    setup <- clean(input$setup)
+    setup <- eq()$min
     if (setup > 0) df <- rbind(gap_row("Equilibration", "Pre-sequence equilibration", setup), df)
 
     df$Position <- seq_len(nrow(df))
@@ -551,17 +602,20 @@ server <- function(input, output, session) {
     n   <- n_inj()
 
     idle_min <- if (isTRUE(input$idle_flow)) {
-      clean(input$buffer) * n +
-        sum(seq_df()$Minutes[seq_df()$Type %in% c("Switchover", "Equilibration")])
+      clean(input$buffer) * n + sum(seq_df()$Minutes[seq_df()$Type == "Switchover"])
     } else 0
     F0 <- df$flow[1]; B0 <- df$B[1] / 100
-    idle <- c(A = idle_min * F0 * (1 - B0), B = idle_min * F0 * B0)
+    at_initial <- function(min) c(A = min * F0 * (1 - B0), B = min * F0 * B0)
+    idle   <- at_initial(idle_min)
+    eq_min <- eq()$min
+    equil  <- at_initial(eq_min)
 
     run    <- per[c("A", "B")] * n
-    sub    <- run + idle
+    sub    <- run + idle + equil
     margin <- sub * clean(input$margin) / 100
     prime  <- c(A = clean(input$prime), B = clean(input$prime))
     list(per = per, n = n, run = run, idle = idle, idle_min = idle_min,
+         equil = equil, eq_min = eq_min,
          margin = margin, prime = prime, total = sub + margin + prime)
   })
 
@@ -584,7 +638,9 @@ server <- function(input, output, session) {
     rows <- list(
       c("Gradient, per injection",                  s$per[["A"]],   s$per[["B"]]),
       c(sprintf("Gradient × %d injections", s$n),   s$run[["A"]],   s$run[["B"]]),
-      c(sprintf("Idle at initial conditions (%s)", fmt_dur(s$idle_min)),
+      c(sprintf("Column equilibration (%s)", fmt_dur(s$eq_min)),
+                                                    s$equil[["A"]], s$equil[["B"]]),
+      c(sprintf("Buffer & switchover at initial conditions (%s)", fmt_dur(s$idle_min)),
                                                     s$idle[["A"]],  s$idle[["B"]]),
       c(sprintf("Safety margin (%g%%)", clean(input$margin)),
                                                     s$margin[["A"]], s$margin[["B"]]),
