@@ -133,6 +133,16 @@ Saved methods are stored **in your browser only** — they won't appear on anoth
 
 ---
 
+## Author, licence & support
+
+Created by **Sarah Hancock**. Released under the [MIT License](LICENSE) — free to use, modify and share with attribution.
+
+Found a bug or have an idea? [Open an issue](https://github.com/sarahehancock/lcms-runtime-calculator/issues).
+
+Like this tool? [☕ Buy me a coffee](https://www.paypal.com/donate/?hosted_button_id=N3BAK3MMB32TL)
+
+---
+
 ## For developers
 
 ### Repository layout
@@ -140,6 +150,7 @@ Saved methods are stored **in your browser only** — they won't appear on anoth
 ```
 app/app.R                       # the Shiny app
 .github/workflows/deploy.yml    # builds with shinylive and deploys to GitHub Pages
+LICENSE                         # MIT License
 ```
 
 ### Deploying to GitHub Pages

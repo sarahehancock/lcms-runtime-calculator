@@ -145,6 +145,23 @@ storage_js <- tags$script(HTML("
   });
 "))
 
+# ---- about / links ---------------------------------------------------------
+
+APP_INFO <- list(
+  author      = "Sarah Hancock",
+  repo        = "https://github.com/sarahehancock/lcms-runtime-calculator",
+  guide       = "https://github.com/sarahehancock/lcms-runtime-calculator#how-to-use-it",
+  issues      = "https://github.com/sarahehancock/lcms-runtime-calculator/issues",
+  license_url = "https://github.com/sarahehancock/lcms-runtime-calculator/blob/main/LICENSE",
+  donate      = "https://www.paypal.com/donate/?hosted_button_id=N3BAK3MMB32TL"
+)
+
+# Link that opens in a new tab (the app runs inside a frame)
+ext_link <- function(href, ..., class = NULL, title = NULL) {
+  tags$a(href = href, target = "_blank", rel = "noopener noreferrer",
+         class = class, title = title, ...)
+}
+
 # ---- UI --------------------------------------------------------------------
 
 ui <- page_navbar(
@@ -355,6 +372,27 @@ ui <- page_navbar(
         )
       )
     )
+  ),
+
+  # ---- right-hand side of the top bar: about menu & donate button ----
+  nav_spacer(),
+  nav_menu(
+    "About",
+    align = "right",
+    nav_item(div(class = "dropdown-item-text small", style = "min-width: 260px;",
+      strong("LC-MS Run Calculator"), br(),
+      "Created by ", APP_INFO$author, br(),
+      "Released under the ", ext_link(APP_INFO$license_url, "MIT License"))),
+    nav_item(tags$hr(class = "dropdown-divider")),
+    nav_item(ext_link(APP_INFO$repo, "Source code on GitHub", class = "dropdown-item")),
+    nav_item(ext_link(APP_INFO$guide, "User guide", class = "dropdown-item")),
+    nav_item(ext_link(APP_INFO$issues, "Report a problem or suggest a feature",
+                      class = "dropdown-item"))
+  ),
+  nav_item(
+    ext_link(APP_INFO$donate, "☕ Like this tool? Buy me a coffee",
+             class = "btn btn-warning btn-sm ms-lg-2 my-1",
+             title = "Donate via PayPal")
   )
 )
 
