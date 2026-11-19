@@ -34,6 +34,15 @@ jobs:
       - name: Export app with Shinylive
         run: Rscript -e 'shinylive::export("app", "site")'
 
+      # Visitor analytics (GoatCounter: free, no cookies, no consent banner).
+      # Replace YOURCODE with the code you chose when signing up at goatcounter.com.
+      - name: Add GoatCounter analytics
+        env:
+          GOATCOUNTER_CODE: sarahehancock
+        run: |
+          sed -i "s#</head>#<script data-goatcounter=\"https://${GOATCOUNTER_CODE}.goatcounter.com/count\" async src=\"//gc.zgo.at/count.js\"></script></head>#" site/index.html
+          grep -q goatcounter site/index.html && echo "GoatCounter added"
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
